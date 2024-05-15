@@ -55,9 +55,8 @@ import java.net.URI;
 import java.util.Map;
 
 public class DataSourceHandler {
-    private static final Log log = Log.getLog(DataSourceHandler.class);
-
     public static final int END_TRANSACTION_WAIT_TIME = 3000;
+    private static final Log log = Log.getLog(DataSourceHandler.class);
 
     /**
      * Connects datasource
@@ -66,11 +65,7 @@ public class DataSourceHandler {
      * @param dataSourceContainer container to connect
      * @param onFinish            finish handler
      */
-    public static void connectToDataSource(
-            @Nullable DBRProgressMonitor monitor,
-            @NotNull DBPDataSourceContainer dataSourceContainer,
-            @Nullable final DBRProgressListener onFinish
-    ) {
+    public static void connectToDataSource(@Nullable DBRProgressMonitor monitor,@NotNull DBPDataSourceContainer dataSourceContainer,@Nullable final DBRProgressListener onFinish) {
         if (dataSourceContainer instanceof final DataSourceDescriptor dataSource && !dataSourceContainer.isConnected()) {
             Job[] connectJobs = Job.getJobManager().find(dataSource);
             if (!ArrayUtils.isEmpty(connectJobs)) {
@@ -90,36 +85,11 @@ public class DataSourceHandler {
                 return;
             }
 
-            CoreFeatures.CONNECTION_OPEN.use(Map.of(
-                    "driver", dataSourceContainer.getDriver().getPreconfiguredId()
-            ));
+            CoreFeatures.CONNECTION_OPEN.use(Map.of("driver", dataSourceContainer.getDriver().getPreconfiguredId()));
             final ConnectJob connectJob = new ConnectJob(dataSource);
 
-            // 현제 접속 정보 조회
-
-            if(dataSource != null){
-                DBPPreferenceStore currentPrefernceStroe = DBWorkbench.getPlatform().getPreferenceStore();
-
-                String loginId = currentPrefernceStroe.getString(ModelPreferences.PNP_LOGIN_ID_STORE);
-                String loginIpAddress = currentPrefernceStroe.getString(ModelPreferences.PNP_LOGIN_IP_ADDRESS);
-                String loginAssistKey = currentPrefernceStroe.getString(ModelPreferences.PNP_LOGIN_ASSSITKEY);
-                String loginSecurityServer = currentPrefernceStroe.getString(ModelPreferences.PNP_LOGIN_SECURITY_SERVER);
-
-                try {
-                    final PnpController pnpInstance = RestClient
-                            .builder(URI.create("http://localhost:8900/dummyapi/api"), PnpController.class)
-                            .create();
-                    loginInfo = pnpInstance.getLoginInfo();
-
-                    if(loginInfo != null && loginInfo.getLoginId().length() > 0){
-                        checkAlivePnpModule = true;
-                    }
-                } catch (Exception e){
-                    // AssistHost 기동 실패 로그 작성
-                    log.debug("ERROR AssistHost NOT ALIVE");
-                }
-
-            }
+            // Pnp Db Access Checking
+            if (checkDbAccess(dataSource, connectJob)) return;
 
             final JobChangeAdapter jobChangeAdapter = new JobChangeAdapter() {
                 @Override
@@ -266,27 +236,6 @@ public class DataSourceHandler {
         return true;
     }
 
-/*
-    public static int checkActiveTransaction(DBCExecutionContext context)
-    {
-        // First rollback active transaction
-        if (isContextTransactionAffected(context)) {
-            // Ask for confirmation
-            TransactionCloseConfirmer closeConfirmer = new TransactionCloseConfirmer(context.getDataSource().getContainer().getName());
-            NosqlUI.syncExec(closeConfirmer);
-            switch (closeConfirmer.result) {
-                case IDialogConstants.YES_ID:
-                    return ISaveablePart2.YES;
-                case IDialogConstants.NO_ID:
-                    return ISaveablePart2.NO;
-                default:
-                    return ISaveablePart2.CANCEL;
-            }
-        }
-        return ISaveablePart2.YES;
-    }
-*/
-
     public static void closeActiveTransaction(DBRProgressMonitor monitor, DBCExecutionContext context, boolean commitTxn) {
         monitor.beginTask("Close active transaction", 1);
         try (DBCSession session = context.openSession(monitor, DBCExecutionPurpose.UTIL, "End active transaction")) {
@@ -376,11 +325,7 @@ public class DataSourceHandler {
         private int countdown = 10;
 
         public TransactionEndConfirmDialog(DBPDataSource dataSource) {
-            super(UIUtils.getActiveShell(),
-                    "End transaction",
-                    NosqlIcons.getImage(UIIcon.TXN_ROLLBACK),
-                    "Transactions in database '" + dataSource.getName() + "' will be ended because of the long idle period." +
-                            "\nPress '" + IDialogConstants.CANCEL_LABEL + "' to prevent this.",
+            super(UIUtils.getActiveShell(),"End transaction",NosqlIcons.getImage(UIIcon.TXN_ROLLBACK),"Transactions in database '" + dataSource.getName() + "' will be ended because of the long idle period." +"\nPress '" + IDialogConstants.CANCEL_LABEL + "' to prevent this.",
                     MessageDialog.WARNING,
                     null,
                     0);
@@ -424,6 +369,52 @@ public class DataSourceHandler {
             Button cancelButton = createButton(parent, IDialogConstants.CANCEL_ID, IDialogConstants.CANCEL_LABEL, true);
             setButtons(okButton, cancelButton);
         }
+    }
+
+    /**
+     * PNP DB Access Control Results
+     * @param dataSource
+     * @param connectJob
+     * @return
+     */
+    private static boolean checkDbAccess(DataSourceDescriptor dataSource, ConnectJob connectJob) {
+        // Added access control function for DB based on access information
+        if(connectJob != null){
+            try {
+                DBPConnectionConfiguration currentConfiguration = dataSource.getConnectionConfiguration();
+
+                if(currentConfiguration != null){
+                    DbAccessDto dbAccessDto = new DbAccessDto(currentConfiguration.getHostName(),
+                            currentConfiguration.getHostPort(),
+                            currentConfiguration.getUserName(),
+                            PnpUtil.getPreferenceStoreString(ModelPreferences.PNP_LOGIN_ID_STORE),
+                            currentConfiguration.getDatabaseName(),
+                            "com",
+                            PnpUtil.getPreferenceStoreString(ModelPreferences.PNP_LOGIN_IP_ADDRESS));
+                    final PnpController pnpInstance = RestClient
+                            .builder(URI.create("http://localhost:22118/api"), PnpController.class)
+                            .create();
+
+                    PnpResult<DbAccessResult> dbAccessResult = pnpInstance.checkDbConnect(dbAccessDto);
+
+                    if(dbAccessResult != null || dbAccessResult.getResult() == null || "false".equals(dbAccessResult.getResult())){
+                        log.debug("PNP DBACCESS DENY");
+                        String message = String.format("IP : %s \n Port : %s \n ID : %s",
+                                currentConfiguration.getHostName(),
+                                currentConfiguration.getHostPort(),
+                                currentConfiguration.getUserName());
+                        PnpUtil.showErrorDialog("Db connection blocked.", message);
+                        return true;
+                    }
+                }
+            } catch (Exception e){
+                log.debug("ERROR Pnp DbAccess Check Fail");
+                // Creating the Db Access Control API Call Fail dialog
+                PnpUtil.showErrorDialog("Pnp DbAccess Check Fail", null);
+                return true;
+            }
+        }
+        return false;
     }
 
 }
